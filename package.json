@@ -1,11 +1,10 @@
 {
   "name": "@ppcassist/amazon-ads-mcp",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Local MCP proxy for Amazon Ads API - authenticates and forwards requests to Amazon's official MCP server",
   "main": "index.js",
   "bin": {
-    "amazon-ads-mcp": "./index.js",
-    "amazon-ads-setup": "./setup.js"
+    "amazon-ads-mcp": "./index.js"
   },
   "keywords": [
     "amazon-ads",

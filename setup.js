@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 const http = require("http");
 const https = require("https");
 const fs = require("fs");
@@ -8,9 +6,6 @@ const os = require("os");
 const { exec } = require("child_process");
 const readline = require("readline");
 
-// ─── PPC Assist OAuth credentials (placeholders) ───
-const PPCASSIST_CLIENT_ID = "amzn1.application-oa2-client.REPLACE_ME";
-const PPCASSIST_CLIENT_SECRET = "REPLACE_ME";
 const REDIRECT_URI_BASE = "http://localhost";
 const CALLBACK_PATH = "/callback";
 
@@ -24,6 +19,57 @@ const TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 
 function print(msg) {
   process.stdout.write(msg + "\n");
+}
+
+function ask(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+function askSecret(question) {
+  return new Promise((resolve) => {
+    process.stdout.write(question);
+    const rl = readline.createInterface({ input: process.stdin });
+
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
+
+    let secret = "";
+    const onData = (key) => {
+      const ch = key.toString();
+      if (ch === "\n" || ch === "\r" || ch === "\u0004") {
+        if (process.stdin.isTTY) {
+          process.stdin.setRawMode(false);
+        }
+        process.stdin.removeListener("data", onData);
+        rl.close();
+        process.stdout.write("\n");
+        resolve(secret.trim());
+      } else if (ch === "\u0003") {
+        // Ctrl+C
+        process.stdout.write("\n");
+        process.exit(1);
+      } else if (ch === "\u007F" || ch === "\b") {
+        // Backspace
+        secret = secret.slice(0, -1);
+      } else {
+        secret += ch;
+        process.stdout.write("*");
+      }
+    };
+
+    process.stdin.on("data", onData);
+    process.stdin.resume();
+  });
 }
 
 function openBrowser(url) {
@@ -101,16 +147,6 @@ function httpGet(urlStr, headers) {
   });
 }
 
-function askQuestion(prompt) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(prompt, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
-}
-
 function getConfigPath() {
   if (process.platform === "darwin") {
     return path.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json");
@@ -118,13 +154,10 @@ function getConfigPath() {
   if (process.platform === "win32") {
     return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Claude", "claude_desktop_config.json");
   }
-  // Linux fallback
   return path.join(os.homedir(), ".config", "Claude", "claude_desktop_config.json");
 }
 
 function detectRegion(profiles) {
-  // Use the first profile's country to guess region
-  // EU marketplaces
   const euCountries = ["UK", "GB", "DE", "FR", "IT", "ES", "NL", "SE", "PL", "BE", "TR", "AE", "SA", "EG", "IN"];
   const feCountries = ["JP", "AU", "SG"];
 
@@ -138,8 +171,10 @@ function detectRegion(profiles) {
 
 // ─── Start local server and wait for callback ───
 
-function waitForCallback(port) {
+function startCallbackServer(port) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+
     const server = http.createServer((req, res) => {
       if (!req.url.startsWith(CALLBACK_PATH)) {
         res.writeHead(404);
@@ -154,6 +189,7 @@ function waitForCallback(port) {
       if (error) {
         res.writeHead(200, { "Content-Type": "text/html" });
         res.end("<html><body><h2>Authorization denied.</h2><p>You can close this tab.</p></body></html>");
+        settled = true;
         server.close();
         reject(new Error(`Amazon returned error: ${error}`));
         return;
@@ -167,28 +203,33 @@ function waitForCallback(port) {
 
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end("<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to the terminal.</p></body></html>");
+      settled = true;
       server.close();
-      resolve(code);
+      resolve({ code, port });
     });
 
     const timeout = setTimeout(() => {
-      server.close();
-      reject(new Error("Timed out waiting for authorization (2 minutes). Please try again."));
+      if (!settled) {
+        settled = true;
+        server.close();
+        reject(new Error("Timed out waiting for authorization (2 minutes). Please try again."));
+      }
     }, TIMEOUT_MS);
 
     server.on("close", () => clearTimeout(timeout));
 
     server.on("error", (err) => {
-      if (err.code === "EADDRINUSE") {
-        resolve(null); // Signal to try next port
-      } else {
-        reject(err);
+      if (!settled) {
+        settled = true;
+        if (err.code === "EADDRINUSE") {
+          resolve(null); // Signal to try next port
+        } else {
+          reject(err);
+        }
       }
     });
 
-    server.listen(port, () => {
-      resolve._server = server; // store for reference
-    });
+    server.listen(port);
   });
 }
 
@@ -199,63 +240,72 @@ async function main() {
   print("\u{1F680} Amazon Ads MCP Setup");
   print("\u2500".repeat(35));
 
-  // Find an available port
-  let port = 8080;
-  let code = null;
+  // Ask for credentials
+  const clientId = await ask("\u2192 Enter your Amazon Ads Client ID: ");
+  if (!clientId) {
+    print("\n\u274C Client ID is required.");
+    process.exit(1);
+  }
 
-  while (port <= 8082) {
+  const clientSecret = await askSecret("\u2192 Enter your Amazon Ads Client Secret: ");
+  if (!clientSecret) {
+    print("\n\u274C Client Secret is required.");
+    process.exit(1);
+  }
+
+  print("");
+
+  // Find an available port and start callback server
+  let result = null;
+
+  for (let port = 8080; port <= 8082; port++) {
     const redirectUri = `${REDIRECT_URI_BASE}:${port}${CALLBACK_PATH}`;
     const authUrl =
-      `${OAUTH_AUTHORIZE_URL}?client_id=${encodeURIComponent(PPCASSIST_CLIENT_ID)}` +
+      `${OAUTH_AUTHORIZE_URL}?client_id=${encodeURIComponent(clientId)}` +
       `&scope=advertising::campaign_management` +
       `&response_type=code` +
       `&redirect_uri=${encodeURIComponent(redirectUri)}`;
 
-    const promise = waitForCallback(port);
+    const promise = startCallbackServer(port);
 
-    // Check if port was available (give server a moment to start)
-    await new Promise((r) => setTimeout(r, 100));
+    // Give server a moment to bind or fail
+    await new Promise((r) => setTimeout(r, 150));
 
-    // Try to get the code; null means port was in use
-    const result = await Promise.race([
+    // Quick check — if port was in use, promise resolves to null immediately
+    const quick = await Promise.race([
       promise,
-      new Promise((r) => setTimeout(() => r("pending"), 200)),
+      new Promise((r) => setTimeout(() => r("waiting"), 300)),
     ]);
 
-    if (result === null) {
+    if (quick === null) {
       print(`  Port ${port} in use, trying ${port + 1}...`);
-      port++;
       continue;
     }
 
-    // Port is available — open browser and wait
+    // Server is listening — open browser
     print(`\u2192 Opening Amazon authorization in your browser...`);
     openBrowser(authUrl);
     print(`\u2192 Waiting for authorization... (press Ctrl+C to cancel)`);
 
-    if (result === "pending") {
-      code = await promise;
-    } else {
-      code = result;
-    }
+    result = quick === "waiting" ? await promise : quick;
     break;
   }
 
-  if (!code) {
+  if (!result) {
     print("\n\u274C Could not find an available port (tried 8080-8082). Please free one and try again.");
     process.exit(1);
   }
 
   print("\u2705 Authorization received");
 
-  // Exchange code for tokens
-  const redirectUri = `${REDIRECT_URI_BASE}:${port}${CALLBACK_PATH}`;
+  // Exchange code for tokens using the actual port that was bound
+  const redirectUri = `${REDIRECT_URI_BASE}:${result.port}${CALLBACK_PATH}`;
   const tokenBody = new URLSearchParams({
     grant_type: "authorization_code",
-    code,
+    code: result.code,
     redirect_uri: redirectUri,
-    client_id: PPCASSIST_CLIENT_ID,
-    client_secret: PPCASSIST_CLIENT_SECRET,
+    client_id: clientId,
+    client_secret: clientSecret,
   }).toString();
 
   let tokenData;
@@ -280,7 +330,7 @@ async function main() {
   try {
     profiles = await httpGet(PROFILES_URL, {
       Authorization: `Bearer ${access_token}`,
-      "Amazon-Advertising-API-ClientId": PPCASSIST_CLIENT_ID,
+      "Amazon-Advertising-API-ClientId": clientId,
     });
   } catch (err) {
     print(`\n\u274C Failed to fetch profiles: ${err.message}`);
@@ -303,10 +353,10 @@ async function main() {
     profiles.forEach((p, i) => {
       const name = p.accountInfo?.name || `Profile ${p.profileId}`;
       const cc = p.countryCode || "";
-      print(`   ${i + 1}. ${name} ${cc ? `(${cc})` : ""} — profile_id: ${p.profileId}`);
+      print(`   ${i + 1}. ${name} ${cc ? `(${cc})` : ""} \u2014 profile_id: ${p.profileId}`);
     });
 
-    const answer = await askQuestion(`\u2192 Select a profile [1-${profiles.length}]: `);
+    const answer = await ask(`\u2192 Select a profile [1-${profiles.length}]: `);
     const idx = parseInt(answer, 10) - 1;
 
     if (isNaN(idx) || idx < 0 || idx >= profiles.length) {
@@ -344,15 +394,14 @@ async function main() {
     command: "npx",
     args: ["-y", "@ppcassist/amazon-ads-mcp"],
     env: {
-      CLIENT_ID: PPCASSIST_CLIENT_ID,
-      CLIENT_SECRET: PPCASSIST_CLIENT_SECRET,
+      CLIENT_ID: clientId,
+      CLIENT_SECRET: clientSecret,
       REFRESH_TOKEN: refresh_token,
       PROFILE_ID: profileId,
       REGION: region,
     },
   };
 
-  // Ensure directory exists
   fs.mkdirSync(configDir, { recursive: true });
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
 
