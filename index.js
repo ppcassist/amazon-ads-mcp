@@ -76,13 +76,35 @@ async function handleRequest(proxy, request) {
     const result = await proxy.forward(request);
 
     if (result.type === "stream") {
-      // SSE stream: pipe each event line directly to stdout
+      // SSE stream: buffer chunks, extract JSON from "data: ..." lines,
+      // and write as newline-delimited JSON-RPC for Claude Desktop
+      let sseBuf = "";
+      result.stream.setEncoding("utf8");
+
       result.stream.on("data", (chunk) => {
-        process.stdout.write(chunk);
+        sseBuf += chunk;
+        let lineEnd;
+        while ((lineEnd = sseBuf.indexOf("\n")) !== -1) {
+          const line = sseBuf.slice(0, lineEnd).trim();
+          sseBuf = sseBuf.slice(lineEnd + 1);
+          if (line.startsWith("data: ")) {
+            const json = line.slice(6);
+            if (json) {
+              process.stdout.write(json + "\n");
+            }
+          }
+        }
       });
 
       result.stream.on("end", () => {
-        // SSE streams end naturally; nothing extra needed
+        // Flush any remaining data in buffer
+        const remaining = sseBuf.trim();
+        if (remaining.startsWith("data: ")) {
+          const json = remaining.slice(6);
+          if (json) {
+            process.stdout.write(json + "\n");
+          }
+        }
       });
 
       result.stream.on("error", (err) => {
