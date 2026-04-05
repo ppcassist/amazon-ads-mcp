@@ -262,7 +262,7 @@ async function main() {
     const redirectUri = `${REDIRECT_URI_BASE}:${port}${CALLBACK_PATH}`;
     const authUrl =
       `${OAUTH_AUTHORIZE_URL}?client_id=${encodeURIComponent(clientId)}` +
-      `&scope=cpc_advertising:campaign_management` +
+      `&scope=${encodeURIComponent("profile advertising::campaign_management")}` +
       `&response_type=code` +
       `&redirect_uri=${encodeURIComponent(redirectUri)}`;
 
